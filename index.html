@@ -1,0 +1,113 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Stick vs Rocks</title>
+  <style>
+    body {
+      margin: 0;
+      overflow: hidden;
+      background: #1e1e1e;
+      color: white;
+      font-family: sans-serif;
+    }
+    canvas {
+      display: block;
+    }
+    #score {
+      position: absolute;
+      top: 10px;
+      left: 10px;
+      font-size: 24px;
+    }
+  </style>
+</head>
+<body>
+  <div id="score">Score: 0</div>
+  <canvas id="gameCanvas"></canvas>
+
+  <script>
+    const canvas = document.getElementById("gameCanvas");
+    const ctx = canvas.getContext("2d");
+    canvas.width = window.innerWidth;
+    canvas.height = window.innerHeight;
+
+    let score = 0;
+    const scoreDisplay = document.getElementById("score");
+
+    const stick = {
+      x: 0,
+      y: 0,
+      width: 100,
+      height: 20
+    };
+
+    const rocks = [];
+
+    function spawnRock() {
+      const rock = {
+        x: Math.random() * canvas.width,
+        y: -20,
+        radius: 15,
+        speed: 3 + Math.random() * 3
+      };
+      rocks.push(rock);
+    }
+
+    function update() {
+      // Update rock positions
+      for (let i = rocks.length - 1; i >= 0; i--) {
+        const r = rocks[i];
+        r.y += r.speed;
+
+        // Collision with stick
+        if (
+          r.x > stick.x &&
+          r.x < stick.x + stick.width &&
+          r.y + r.radius > stick.y &&
+          r.y - r.radius < stick.y + stick.height
+        ) {
+          rocks.splice(i, 1);
+          score++;
+          scoreDisplay.innerText = `Score: ${score}`;
+        } else if (r.y - r.radius > canvas.height) {
+          rocks.splice(i, 1); // Remove rock if off screen
+        }
+      }
+    }
+
+    function draw() {
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+      // Draw stick
+      ctx.fillStyle = "white";
+      ctx.fillRect(stick.x, stick.y, stick.width, stick.height);
+
+      // Draw rocks
+      ctx.fillStyle = "gray";
+      for (const r of rocks) {
+        ctx.beginPath();
+        ctx.arc(r.x, r.y, r.radius, 0, Math.PI * 2);
+        ctx.fill();
+      }
+    }
+
+    function gameLoop() {
+      update();
+      draw();
+      requestAnimationFrame(gameLoop);
+    }
+
+    // Mouse movement controls stick
+    canvas.addEventListener("mousemove", (e) => {
+      stick.x = e.clientX - stick.width / 2;
+      stick.y = e.clientY - stick.height / 2;
+    });
+
+    // Start spawning rocks
+    setInterval(spawnRock, 500);
+    gameLoop();
+  </script>
+</body>
+</html>
