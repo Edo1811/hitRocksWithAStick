@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
-  <title>Stick vs Rocks — Gravity + Bottom Clear</title>
+  <title>Stick vs Rocks — Fixed Physics</title>
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <style>
     :root { color-scheme: dark; }
@@ -26,14 +26,42 @@
       user-select: none;
       z-index: 10;
     }
+    #tips {
+      position: fixed;
+      bottom: 10px;
+      left: 12px;
+      padding: 6px 10px;
+      font-size: 12px;
+      color: #bdbdbd;
+      background: rgba(0,0,0,0.25);
+      border: 1px solid rgba(255,255,255,0.06);
+      border-radius: 10px;
+      user-select: none;
+      z-index: 10;
+    }
     canvas { display: block; }
   </style>
 </head>
 <body>
   <div id="score">Score: 0</div>
+  <div id="tips">Move the mouse to swing. Bat tracks your motion with a smooth PD controller.</div>
   <canvas id="gameCanvas"></canvas>
 
   <script>
+    // =============================================================
+    // Stick vs Rocks — Physics Fixes
+    // -------------------------------------------------------------
+    // 🔧 What changed vs your version:
+    // 1) Replaced the torque-from-lateral-speed hack with a stable
+    //    PD controller that steers the bat toward the mouse motion
+    //    direction (perpendicular to motion, like a real bat swing).
+    // 2) Added sub-stepping for physics to avoid tunneling & jitter
+    //    when frame time spikes.
+    // 3) Tweaked restitution/damping and clamped angular velocity.
+    // 4) Cleaned collision response & kept a light reaction torque.
+    // Result: snappy, predictable control and solid hits.
+    // =============================================================
+
     // ========= Canvas =========
     const canvas = document.getElementById("gameCanvas");
     const ctx = canvas.getContext("2d");
@@ -53,22 +81,25 @@
     const GRAVITY = 9.81;                  // m/s^2 (realistic g)
     const g_px = GRAVITY * PPM;            // px/s^2
 
-    // Bat IRL-ish params
+    // Bat params (mass/inertia in SI based on length in meters)
     const BAT_MASS = 0.9;                  // kg
-    const TORQUE_PER_V_PERP = 0.8;         // N·m per (m/s) lateral mouse speed
-    const ROT_DAMPING = 0.8;               // N·m·s (rotational damping)
-    const MAX_ANG_VEL = 20;                // rad/s clamp
+    const MAX_ANG_VEL = 18;                // rad/s clamp (keeps swings sane)
+
+    // PD control (torque = Kp * angleError - Kd * angVel)
+    // These are physical torques (N·m). Keep moderate.
+    const Kp = 85;                         // proportional gain
+    const Kd = 18;                         // damping on angular velocity
 
     // Rock physics
     const ROCK_MASS = 0.25;                // kg (arbitrary-ish)
-    const ROCK_E = 0.9;                    // restitution with bat
+    const ROCK_E = 0.75;                   // restitution with bat
     const WALL_E = 0.9;                    // side/top bounciness
-    const REACTION_FACTOR = 0.35;          // how much the rock slows your bat on impact
+    const REACTION_FACTOR = 0.2;           // reaction coupling to bat
 
-    // ========= Audio ("boooo") =========
+    // ========= Audio (subtle "boooo") =========
     let audioCtx = null;
-    function initAudio() { if (!audioCtx) audioCtx = new (AudioContext || webkitAudioContext)(); }
-    document.addEventListener("pointerdown", () => { initAudio(); audioCtx.resume(); }, { once: true });
+    function initAudio() { if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)(); }
+    document.addEventListener("pointerdown", () => { initAudio(); audioCtx.resume && audioCtx.resume(); }, { once: true });
     function playBoo(intensity = 1) {
       if (!audioCtx) return;
       const now = audioCtx.currentTime;
@@ -97,18 +128,18 @@
       thickness: 22,
       angle: 0,
       angVel: 0,
+      targetAngle: 0,
+      lastTargetAngle: 0,
       get length_m() { return this.lengthPx / PPM; },
       get I() { return (1/3) * BAT_MASS * this.length_m * this.length_m; } // rod about one end
     };
-
-    let lastMouseX = stick.x, lastMouseY = stick.y, lastMouseT = performance.now();
 
     // ========= Rocks =========
     const rocks = [];
     function spawnRock() {
       if (rocks.length >= MAX_ROCKS) return; // CAP
-      const speedY = 60 + Math.random() * 120;   // px/s (lower start, gravity will take it from here)
-      const speedX = (Math.random() - 0.5) * 120;
+      const speedY = 80 + Math.random() * 160;   // px/s
+      const speedX = (Math.random() - 0.5) * 140;
       rocks.push({
         x: Math.random() * canvas.width,
         y: -40,
@@ -131,6 +162,22 @@
       return pts;
     }
 
+    // ========= Utils =========
+    function wrapAngle(a) {
+      // wrap to [-PI, PI)
+      a = (a + Math.PI) % (Math.PI * 2);
+      return a < 0 ? a + Math.PI * 2 - Math.PI : a - Math.PI;
+    }
+    function angleDiff(target, a) {
+      let d = wrapAngle(target - a);
+      return d;
+    }
+    function mixAngle(a, b, t) {
+      // shortest path blend
+      const d = angleDiff(b, a);
+      return wrapAngle(a + d * t);
+    }
+
     // ========= Collision (circle vs oriented rect) =========
     function circleVsBatWithContact(cx, cy, cr) {
       const rx = cx - stick.x, ry = cy - stick.y;
@@ -145,7 +192,7 @@
       const dist2 = dx*dx + dy*dy;
 
       let nLocalX, nLocalY, penetration;
-      if (dist2 === 0) { // inside: use nearest face
+      if (dist2 === 0) { // perfectly on the boundary; pick nearest face normal
         const distLeft = (lx + halfW), distRight = (halfW - lx), distBottom = (ly - minY), distTop = (maxY - ly);
         const minDist = Math.min(distLeft, distRight, distBottom, distTop);
         if (minDist === distLeft)       { nLocalX = -1; nLocalY =  0; }
@@ -222,35 +269,68 @@
     }
 
     function drawBackground() {
-      const g = ctx.createRadialGradient(canvas.width/2, canvas.height/2, Math.min(canvas.width, canvas.height)*0.1,
-                                         canvas.width/2, canvas.height/2, Math.max(canvas.width, canvas.height)*0.7);
+      const g = ctx.createRadialGradient(
+        canvas.width/2, canvas.height/2, Math.min(canvas.width, canvas.height)*0.1,
+        canvas.width/2, canvas.height/2, Math.max(canvas.width, canvas.height)*0.7
+      );
       g.addColorStop(0, "#0f0f10"); g.addColorStop(1, "#0a0a0b");
       ctx.fillStyle = g; ctx.fillRect(0, 0, canvas.width, canvas.height);
     }
 
-    // ========= Update (dt-based) =========
-    let lastFrameT = performance.now();
-    function update() {
+    // ========= Mouse state =========
+    let lastMouseX = stick.x, lastMouseY = stick.y, lastMouseT = performance.now();
+    let haveMotion = false; // helps avoid jitter when the mouse is still
+
+    canvas.addEventListener("pointermove", (e) => {
       const now = performance.now();
-      const dt = Math.min(0.033, (now - lastFrameT) / 1000); // clamp if tab hiccups
-      lastFrameT = now;
+      const dt = Math.max(0.001, (now - lastMouseT) / 1000);
+      const dx = e.clientX - lastMouseX, dy = e.clientY - lastMouseY;
 
-      // Bat angular dynamics (damping only; torque from mouse added in mousemove)
-      const tau_damp = -ROT_DAMPING * stick.angVel;
-      stick.angVel += (tau_damp / stick.I) * dt;
-      stick.angle += stick.angVel * dt;
+      // Move pivot to mouse
+      stick.x = e.clientX; stick.y = e.clientY;
 
-      // Rocks
+      // Compute desired orientation: perpendicular to motion (bat axis = +local Y)
+      const speed = Math.hypot(dx, dy) / dt; // px/s
+      if (speed > 40) { // ignore tiny jitter
+        const dir = Math.atan2(dy, dx);
+        const desired = dir + Math.PI / 2; // rod points perpendicular to motion
+        // Smooth target to avoid twitching (time-constant ~100ms)
+        const t = 1 - Math.exp(-dt * 10);
+        stick.targetAngle = mixAngle(stick.targetAngle, desired, t);
+        haveMotion = true;
+      } else if (!haveMotion) {
+        // Initialize target once on first move
+        stick.targetAngle = stick.angle;
+      }
+
+      lastMouseX = e.clientX; lastMouseY = e.clientY; lastMouseT = now;
+    });
+
+    // ========= Update (dt-based with substeps) =========
+    let lastFrameT = performance.now();
+
+    function integrate(subdt) {
+      // --- Bat angular dynamics via PD control ---
+      const e = angleDiff(stick.targetAngle, stick.angle);
+      const tau_pd = Kp * e - Kd * stick.angVel;  // N·m
+      // α = τ / I
+      stick.angVel += (tau_pd / stick.I) * subdt;
+      // Clamp
+      if (stick.angVel > MAX_ANG_VEL) stick.angVel = MAX_ANG_VEL;
+      if (stick.angVel < -MAX_ANG_VEL) stick.angVel = -MAX_ANG_VEL;
+      stick.angle = wrapAngle(stick.angle + stick.angVel * subdt);
+
+      // --- Rocks ---
       for (let i = rocks.length - 1; i >= 0; i--) {
         const r = rocks[i];
 
-        // Gravity acceleration (proper g in px/s^2)
-        r.vy += g_px * dt;
+        // Gravity acceleration (px/s^2)
+        r.vy += g_px * subdt;
 
         // Integrate position
-        r.x += r.vx * dt;
-        r.y += r.vy * dt;
-        r.rotation += r.rotationSpeed * dt;
+        r.x += r.vx * subdt;
+        r.y += r.vy * subdt;
+        r.rotation += r.rotationSpeed * subdt;
 
         // Wall bounces: left/right/top; bottom = delete
         if (r.x - r.radius < 0) {
@@ -271,8 +351,7 @@
         // Bat collision
         const hit = circleVsBatWithContact(r.x, r.y, r.radius);
         if (hit) {
-          score++; scoreDisplay.textContent = `Score: ${score}`;
-
+          // Contact normal & point
           const nx = hit.normal.x, ny = hit.normal.y;
           const cx = hit.contact.x, cy = hit.contact.y;
 
@@ -281,30 +360,36 @@
           const vSurfX = -stick.angVel * ry;
           const vSurfY =  stick.angVel * rx;
 
-          // Relative velocity
+          // Relative velocity (rock minus bat surface)
           const vRelX = r.vx - vSurfX;
           const vRelY = r.vy - vSurfY;
           const vn = vRelX * nx + vRelY * ny;
 
           if (vn < 0) {
-            // Normal impulse (infinite-mass bat approx)
-            const j = -(1 + ROCK_E) * vn * ROCK_MASS;
+            score++; scoreDisplay.textContent = `Score: ${score}`;
+
+            // Normal impulse (bat ≈ infinite mass)
+            let j = -(1 + ROCK_E) * vn * ROCK_MASS;
+            // Safety clamp to avoid numerical explosions on rare edge cases
+            const jMax = 2.5 * ROCK_MASS * Math.hypot(vRelX, vRelY);
+            if (j > jMax) j = jMax;
+
             r.vx += (j * nx) / ROCK_MASS;
             r.vy += (j * ny) / ROCK_MASS;
 
-            // Tangential impulse (grip)
+            // Tangential grip/friction to add spin & controllability
             const tx = -ny, ty = nx;
             const vt = vRelX * tx + vRelY * ty;
-            const jt = -0.15 * vt * ROCK_MASS;
+            const jt = -0.12 * vt * ROCK_MASS; // small
             r.vx += (jt * tx) / ROCK_MASS;
             r.vy += (jt * ty) / ROCK_MASS;
 
             // Spin kick + separation
             r.rotationSpeed += jt * 0.002;
-            r.x += nx * (hit.penetration + 0.5);
-            r.y += ny * (hit.penetration + 0.5);
+            r.x += nx * (hit.penetration + 0.6);
+            r.y += ny * (hit.penetration + 0.6);
 
-            // Reaction torque on the bat
+            // Reaction torque on the bat (reduced)
             const torqueImpulse = (rx * ny - ry * nx) * j;
             stick.angVel -= (torqueImpulse / stick.I) * REACTION_FACTOR;
 
@@ -316,6 +401,17 @@
       }
     }
 
+    function update() {
+      const now = performance.now();
+      let dt = Math.min(0.05, (now - lastFrameT) / 1000); // clamp if tab hiccups
+      lastFrameT = now;
+
+      // Sub-step for stability (<= 8 ms per step)
+      const steps = Math.max(1, Math.min(6, Math.ceil(dt / 0.008)));
+      const subdt = dt / steps;
+      for (let i = 0; i < steps; i++) integrate(subdt);
+    }
+
     // ========= Render =========
     function draw() {
       ctx.clearRect(0, 0, canvas.width, canvas.height);
@@ -325,33 +421,6 @@
     }
 
     function gameLoop() { update(); draw(); requestAnimationFrame(gameLoop); }
-
-    // ========= Mouse → torque from lateral speed; pivot follows mouse =========
-    canvas.addEventListener("mousemove", (e) => {
-      const now = performance.now();
-      const dt = Math.max(0.001, (now - lastMouseT) / 1000);
-      const dx = e.clientX - lastMouseX, dy = e.clientY - lastMouseY;
-
-      // Mouse velocity in m/s
-      const vx_ms = (dx / PPM) / dt, vy_ms = (dy / PPM) / dt;
-
-      // Local X unit (perpendicular to bat axis which is +local Y)
-      const exx = Math.cos(stick.angle), exy = Math.sin(stick.angle);
-      const v_perp = vx_ms * exx + vy_ms * exy;   // lateral speed
-
-      // τ = k * v_perp, α = τ / I
-      const tau = TORQUE_PER_V_PERP * v_perp;
-      stick.angVel += (tau / stick.I) * dt;
-
-      // Clamp
-      if (stick.angVel > MAX_ANG_VEL) stick.angVel = MAX_ANG_VEL;
-      if (stick.angVel < -MAX_ANG_VEL) stick.angVel = -MAX_ANG_VEL;
-
-      // Move pivot to mouse
-      stick.x = e.clientX; stick.y = e.clientY;
-
-      lastMouseX = e.clientX; lastMouseY = e.clientY; lastMouseT = now;
-    });
 
     // ========= Start =========
     setInterval(spawnRock, SPAWN_INTERVAL_MS);
