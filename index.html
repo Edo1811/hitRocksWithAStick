@@ -1,430 +1,706 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="en">
 <head>
-  <meta charset="UTF-8" />
-  <title>Stick vs Rocks — Fixed Physics</title>
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <style>
-    :root { color-scheme: dark; }
-    html, body {
-      margin: 0;
-      height: 100%;
-      overflow: hidden;
-      background: #0f0f10;
-      font-family: system-ui, -apple-system, Segoe UI, Roboto, Inter, Arial, sans-serif;
-    }
-    #score {
-      position: fixed;
-      top: 12px;
-      left: 12px;
-      padding: 6px 10px;
-      background: rgba(0,0,0,0.35);
-      border: 1px solid rgba(255,255,255,0.08);
-      border-radius: 10px;
-      font-weight: 700;
-      letter-spacing: 0.5px;
-      user-select: none;
-      z-index: 10;
-    }
-    #tips {
-      position: fixed;
-      bottom: 10px;
-      left: 12px;
-      padding: 6px 10px;
-      font-size: 12px;
-      color: #bdbdbd;
-      background: rgba(0,0,0,0.25);
-      border: 1px solid rgba(255,255,255,0.06);
-      border-radius: 10px;
-      user-select: none;
-      z-index: 10;
-    }
-    canvas { display: block; }
-  </style>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Rock Bonk</title>
+<style>
+  html,body{margin:0;height:100%;background:#07080c;overflow:hidden}
+  canvas{display:block;width:100vw;height:100vh;cursor:none;touch-action:none}
+</style>
 </head>
 <body>
-  <div id="score">Score: 0</div>
-  <div id="tips">Move the mouse to swing. Bat tracks your motion with a smooth PD controller.</div>
-  <canvas id="gameCanvas"></canvas>
+<canvas id="c"></canvas>
+<script>
+'use strict';
+const cv = document.getElementById('c'), ctx = cv.getContext('2d');
+const TAU = Math.PI * 2;
+const rand = (a, b) => a + Math.random() * (b - a);
+const clamp = (v, a, b) => v < a ? a : v > b ? b : v;
+const lerp = (a, b, t) => a + (b - a) * t;
+const FONT = 'system-ui,-apple-system,"Segoe UI",Roboto,sans-serif';
 
-  <script>
-    // =============================================================
-    // Stick vs Rocks — Physics Fixes
-    // -------------------------------------------------------------
-    // 🔧 What changed vs your version:
-    // 1) Replaced the torque-from-lateral-speed hack with a stable
-    //    PD controller that steers the bat toward the mouse motion
-    //    direction (perpendicular to motion, like a real bat swing).
-    // 2) Added sub-stepping for physics to avoid tunneling & jitter
-    //    when frame time spikes.
-    // 3) Tweaked restitution/damping and clamped angular velocity.
-    // 4) Cleaned collision response & kept a light reaction torque.
-    // Result: snappy, predictable control and solid hits.
-    // =============================================================
+let W = 0, H = 0, DPR = 1;
+const bg = document.createElement('canvas');
+const core = { x: 0, y: 0, r: 34, hp: 100, max: 100, hit: 0 };
 
-    // ========= Canvas =========
-    const canvas = document.getElementById("gameCanvas");
-    const ctx = canvas.getContext("2d");
-    function resize() { canvas.width = innerWidth; canvas.height = innerHeight; }
-    addEventListener("resize", resize); resize();
+function buildBg() {
+  bg.width = W * DPR; bg.height = H * DPR;
+  const b = bg.getContext('2d');
+  b.setTransform(DPR, 0, 0, DPR, 0, 0);
+  const g = b.createRadialGradient(W / 2, H / 2, 0, W / 2, H / 2, Math.hypot(W, H) / 2);
+  g.addColorStop(0, '#1c2231'); g.addColorStop(0.55, '#11151e'); g.addColorStop(1, '#06070a');
+  b.fillStyle = g; b.fillRect(0, 0, W, H);
+  const n = (W * H) / 1800;
+  for (let i = 0; i < n; i++) {
+    b.fillStyle = `rgba(${Math.random() < .5 ? '255,255,255' : '120,140,180'},${rand(.015, .06)})`;
+    b.beginPath(); b.arc(rand(0, W), rand(0, H), rand(.5, 2.6), 0, TAU); b.fill();
+  }
+  b.strokeStyle = 'rgba(120,200,255,0.05)'; b.lineWidth = 1;
+  b.setLineDash([4, 10]);
+  for (const rr of [110, 220, 360]) { b.beginPath(); b.arc(W / 2, H / 2, rr, 0, TAU); b.stroke(); }
+}
+function resize() {
+  DPR = Math.min(2, window.devicePixelRatio || 1);
+  W = innerWidth; H = innerHeight;
+  cv.width = W * DPR; cv.height = H * DPR;
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  core.x = W / 2; core.y = H / 2;
+  buildBg();
+}
+addEventListener('resize', resize); resize();
 
-    // ========= Score =========
-    let score = 0;
-    const scoreDisplay = document.getElementById("score");
+/* ---------- input ---------- */
+const mouse = { x: W / 2, y: H / 2 + 170 };
+cv.addEventListener('pointermove', e => { mouse.x = e.clientX; mouse.y = e.clientY; });
+cv.addEventListener('pointerdown', e => { mouse.x = e.clientX; mouse.y = e.clientY; onClick(); });
 
-    // ========= Tunables =========
-    const MAX_ROCKS = 40;                 // rock cap
-    const SPAWN_INTERVAL_MS = 450;
+/* ---------- audio ---------- */
+let AC = null, master = null, noiseBuf = null, sndBudget = 0;
+function initAudio() {
+  if (AC) { if (AC.state === 'suspended') AC.resume(); return; }
+  try {
+    AC = new (window.AudioContext || window.webkitAudioContext)();
+    master = AC.createGain(); master.gain.value = 0.45; master.connect(AC.destination);
+    noiseBuf = AC.createBuffer(1, AC.sampleRate * 0.6, AC.sampleRate);
+    const d = noiseBuf.getChannelData(0);
+    for (let i = 0; i < d.length; i++) d[i] = Math.random() * 2 - 1;
+  } catch (e) { AC = null; }
+}
+const sndOk = () => AC && sndBudget-- > 0;
+function sNoise(dur, freq, type, vol, q = 1) {
+  const t = AC.currentTime, s = AC.createBufferSource(), f = AC.createBiquadFilter(), g = AC.createGain();
+  s.buffer = noiseBuf; f.type = type; f.frequency.value = freq; f.Q.value = q;
+  g.gain.setValueAtTime(vol, t); g.gain.exponentialRampToValueAtTime(0.001, t + dur);
+  s.connect(f); f.connect(g); g.connect(master); s.start(t); s.stop(t + dur);
+}
+function sTone(f0, f1, dur, vol, type = 'sine') {
+  const t = AC.currentTime, o = AC.createOscillator(), g = AC.createGain();
+  o.type = type; o.frequency.setValueAtTime(f0, t); o.frequency.exponentialRampToValueAtTime(Math.max(20, f1), t + dur);
+  g.gain.setValueAtTime(vol, t); g.gain.exponentialRampToValueAtTime(0.001, t + dur);
+  o.connect(g); g.connect(master); o.start(t); o.stop(t + dur);
+}
+const sfxHit = p => { sNoise(.07, 500 + p * 900, 'lowpass', .25 + .3 * p, 2); sTone(170 + p * 90, 60, .09, .22 * p + .05); };
+const sfxBreak = p => { sNoise(.22, 1400 - p * 700, 'bandpass', .55, .8); sTone(140 - p * 50, 40, .22, .35); };
+const sfxBoom = () => { sNoise(.6, 280, 'lowpass', .9, .7); sTone(95, 25, .6, .55); };
+const sfxCore = () => { sTone(240, 50, .5, .5, 'triangle'); sNoise(.3, 500, 'lowpass', .5); };
+const sfxFrenzy = () => { sTone(180, 1100, .55, .18, 'sawtooth'); sTone(270, 1600, .55, .1, 'square'); };
+const sfxHome = () => { sTone(400, 1400, .25, .2, 'triangle'); };
+const sfxCrit = () => { sTone(1500, 2400, .08, .12, 'square'); };
 
-    // Physics scaling (pixels ↔ meters)
-    const PPM = 100;                       // 100 px ≈ 1 m
-    const GRAVITY = 9.81;                  // m/s^2 (realistic g)
-    const g_px = GRAVITY * PPM;            // px/s^2
+/* ---------- game data ---------- */
+const TYPES = {
+  stone: { tough: 420, mass: 1.0, pts: 10, hi: '#c8cdd6', base: '#868b95', dark: '#41454e', glow: '#e6ecf5' },
+  iron:  { tough: 820, mass: 2.2, pts: 25, hi: '#b4c4dc', base: '#566377', dark: '#212834', glow: '#cfe0ff' },
+  magma: { tough: 360, mass: 1.1, pts: 20, hi: '#7d4b3d', base: '#4a2b24', dark: '#1d100d', glow: '#ff7a2a' },
+  gold:  { tough: 300, mass: 0.8, pts: 60, hi: '#fff3b0', base: '#e0ae38', dark: '#86580d', glow: '#ffe27a' },
+};
+const STICK_R = 6;
+let state = 'menu', overT = 0;
+let rocks = [], pending = [], booms = [], parts = [], texts = [];
+let score = 0, shownScore = 0, combo = 0, comboT = 0, heat = 0, frenzy = 0;
+let wave = 0, queue = [], spawnT = 0, waveBreak = 0;
+let shake = 0, hitstop = 0, hitstopCD = 0, time = 0, dmgFlash = 0, banner = null;
+let best = 0;
+try { best = +localStorage.getItem('rockbonk_best') || 0; } catch (e) {}
 
-    // Bat params (mass/inertia in SI based on length in meters)
-    const BAT_MASS = 0.9;                  // kg
-    const MAX_ANG_VEL = 18;                // rad/s clamp (keeps swings sane)
+const stick = { hx: mouse.x, hy: mouse.y, tx: mouse.x, ty: mouse.y + 150, ptx: mouse.x, pty: mouse.y + 150, len: 150, trail: [] };
+let vhx = 0, vhy = 0, vtx = 0, vty = 0;
 
-    // PD control (torque = Kp * angleError - Kd * angVel)
-    // These are physical torques (N·m). Keep moderate.
-    const Kp = 85;                         // proportional gain
-    const Kd = 18;                         // damping on angular velocity
+const mult = () => 1 + Math.floor(combo / 5);
+const cruise = () => (55 + Math.min(wave, 15) * 7) * clamp(Math.min(W, H) / 800, 0.7, 1.4);
 
-    // Rock physics
-    const ROCK_MASS = 0.25;                // kg (arbitrary-ish)
-    const ROCK_E = 0.75;                   // restitution with bat
-    const WALL_E = 0.9;                    // side/top bounciness
-    const REACTION_FACTOR = 0.2;           // reaction coupling to bat
+function makeRock(x, y, type, r) {
+  const n = 8 + (Math.random() * 5 | 0), pts = [];
+  for (let i = 0; i < n; i++) pts.push([i / n * TAU + rand(-.2, .2), rand(.78, 1.05)]);
+  const cracks = [];
+  for (let i = 0; i < 3; i++) { const a = rand(0, TAU); cracks.push([a, rand(.1, .4), a + rand(-.7, .7), rand(.65, .95)]); }
+  return { x, y, vx: 0, vy: 0, r, type, a: rand(0, TAU), av: rand(-1, 1), pts, cracks, hp: 1,
+           hitCD: 0, noCol: 0, boomImm: 0, flash: 0, launched: false, dead: false, seed: Math.random() * 100 };
+}
+function pickType(n) {
+  let c = 0; const x = Math.random();
+  if (n >= 2 && x < (c += 0.06)) return 'gold';
+  if (n >= 3 && x < (c += Math.min(0.22, 0.04 * n))) return 'magma';
+  if (n >= 2 && x < (c += Math.min(0.25, 0.06 + 0.03 * n))) return 'iron';
+  return 'stone';
+}
+function spawnRock(type) {
+  const r = type === 'gold' ? rand(16, 22) : type === 'iron' ? rand(26, 40) : rand(22, 40);
+  const e = Math.random() * 4 | 0, m = r + 20;
+  let x, y;
+  if (e === 0) { x = rand(0, W); y = -m; } else if (e === 1) { x = W + m; y = rand(0, H); }
+  else if (e === 2) { x = rand(0, W); y = H + m; } else { x = -m; y = rand(0, H); }
+  const k = makeRock(x, y, type, r), dx = core.x - x, dy = core.y - y, d = Math.hypot(dx, dy);
+  k.vx = dx / d * cruise(); k.vy = dy / d * cruise();
+  rocks.push(k);
+}
 
-    // ========= Audio (subtle "boooo") =========
-    let audioCtx = null;
-    function initAudio() { if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)(); }
-    document.addEventListener("pointerdown", () => { initAudio(); audioCtx.resume && audioCtx.resume(); }, { once: true });
-    function playBoo(intensity = 1) {
-      if (!audioCtx) return;
-      const now = audioCtx.currentTime;
-      const dur = 0.22 + 0.12 * Math.min(intensity, 2);
-      const osc = audioCtx.createOscillator();
-      const filt = audioCtx.createBiquadFilter();
-      const gain = audioCtx.createGain();
-      osc.type = "sine";
-      filt.type = "lowpass";
-      filt.frequency.value = 700;
-      filt.Q.value = 0.5;
-      osc.frequency.setValueAtTime(180, now);
-      osc.frequency.exponentialRampToValueAtTime(90, now + dur);
-      gain.gain.setValueAtTime(0.0001, now);
-      gain.gain.exponentialRampToValueAtTime(0.45 * Math.min(1, intensity), now + 0.01);
-      gain.gain.exponentialRampToValueAtTime(0.0001, now + dur);
-      osc.connect(filt).connect(gain).connect(audioCtx.destination);
-      osc.start(now); osc.stop(now + dur + 0.05);
+/* ---------- fx ---------- */
+function burst(x, y, n, col, spd, type = 'spark', size = 2) {
+  for (let i = 0; i < n; i++) {
+    const a = rand(0, TAU), s = rand(spd * .3, spd), l = rand(.3, .75);
+    parts.push({ x, y, vx: Math.cos(a) * s, vy: Math.sin(a) * s, life: l, max: l, col, type, size: rand(size * .6, size * 1.4), a: rand(0, TAU), av: rand(-12, 12) });
+  }
+  if (parts.length > 1000) parts.splice(0, parts.length - 1000);
+}
+function ring(x, y, r0, r1, col, life = .35, w = 3) { parts.push({ x, y, r0, r1, col, life, max: life, type: 'ring', w }); }
+function addText(x, y, txt, col, size = 18) { texts.push({ x, y, txt, col, size, life: 1 }); }
+function showBanner(text, sub = '') { banner = { text, sub, t: 0 }; }
+function doHitstop(t) { if (hitstopCD <= 0) { hitstop = Math.max(hitstop, t); hitstopCD = 0.15; } }
+
+/* ---------- combat ---------- */
+function damageRock(r, imp, src, crit = false) {
+  if (r.dead) return;
+  const T = TYPES[r.type], fr = frenzy > 0 && src === 'stick';
+  if (imp < (fr ? 40 : 110)) return;
+  r.hp -= imp / T.tough * (crit ? 1.35 : 1) * (fr ? 3 : 1);
+  r.flash = 1;
+  const p = clamp(imp / 1000, 0, 1);
+  if (crit) { burst(r.x, r.y, 10, '#ffe066', 450, 'spark', 2); if (sndOk()) sfxCrit(); }
+  if (r.hp <= 0) breakRock(r, src, crit);
+  else {
+    burst(r.x, r.y, 4 + p * 10 | 0, T.glow, 200 + p * 300, 'spark', 1.5);
+    if (src === 'stick' && sndOk()) sfxHit(p);
+    shake += p * 3;
+  }
+}
+function breakRock(r, src, crit) {
+  r.dead = true;
+  const T = TYPES[r.type];
+  if (state === 'play') {
+    combo++; comboT = 2.4;
+    const pts = Math.round(T.pts * (0.6 + r.r / 40) * mult() * (src === 'chain' ? 2 : 1) * (crit ? 1.5 : 1));
+    score += pts;
+    if (frenzy <= 0) heat = Math.min(1, heat + 0.05 + (src === 'chain' ? 0.03 : 0));
+    const lbl = (src === 'chain' ? 'CHAIN ' : src === 'boom' ? 'BOOM ' : crit ? 'CRIT ' : '') + '+' + pts;
+    addText(r.x, r.y, lbl, src === 'chain' ? '#7fd4ff' : src === 'boom' ? '#ff9a4a' : crit ? '#ffe066' : r.type === 'gold' ? '#ffd24a' : '#ffffff', crit || src !== 'stick' ? 20 : 17);
+  }
+  if (r.r > 18) {
+    const n = r.r > 33 ? 3 : 2, base = rand(0, TAU);
+    for (let i = 0; i < n; i++) {
+      const a = base + i / n * TAU + rand(-.3, .3), cr = r.r * rand(.52, .62);
+      const c = makeRock(r.x + Math.cos(a) * r.r * .4, r.y + Math.sin(a) * r.r * .4, r.type, cr);
+      const s = rand(120, 260);
+      c.vx = r.vx * .6 + Math.cos(a) * s; c.vy = r.vy * .6 + Math.sin(a) * s;
+      c.av = rand(-4, 4); c.noCol = .25; c.hitCD = .12; c.boomImm = .3;
+      c.launched = r.launched && Math.hypot(c.vx, c.vy) > 450;
+      pending.push(c);
     }
-
-    // ========= Bat (pivot at mouse) =========
-    const stick = {
-      x: canvas.width / 2,
-      y: canvas.height / 2,
-      lengthPx: 170,
-      thickness: 22,
-      angle: 0,
-      angVel: 0,
-      targetAngle: 0,
-      lastTargetAngle: 0,
-      get length_m() { return this.lengthPx / PPM; },
-      get I() { return (1/3) * BAT_MASS * this.length_m * this.length_m; } // rod about one end
-    };
-
-    // ========= Rocks =========
-    const rocks = [];
-    function spawnRock() {
-      if (rocks.length >= MAX_ROCKS) return; // CAP
-      const speedY = 80 + Math.random() * 160;   // px/s
-      const speedX = (Math.random() - 0.5) * 140;
-      rocks.push({
-        x: Math.random() * canvas.width,
-        y: -40,
-        radius: 22 + Math.random() * 18,
-        vx: speedX,
-        vy: speedY,
-        rotation: Math.random() * Math.PI * 2,
-        rotationSpeed: (Math.random() - 0.5) * 1.6, // rad/s
-        shape: generateRockShape(16, 0.45)
-      });
-    }
-
-    function generateRockShape(sides = 14, roughness = 0.35) {
-      const pts = [];
-      for (let i = 0; i < sides; i++) {
-        const ang = (i / sides) * Math.PI * 2;
-        const radJitter = 1 + (Math.random() * 2 - 1) * roughness;
-        pts.push({ ang, radJitter });
-      }
-      return pts;
-    }
-
-    // ========= Utils =========
-    function wrapAngle(a) {
-      // wrap to [-PI, PI)
-      a = (a + Math.PI) % (Math.PI * 2);
-      return a < 0 ? a + Math.PI * 2 - Math.PI : a - Math.PI;
-    }
-    function angleDiff(target, a) {
-      let d = wrapAngle(target - a);
-      return d;
-    }
-    function mixAngle(a, b, t) {
-      // shortest path blend
-      const d = angleDiff(b, a);
-      return wrapAngle(a + d * t);
-    }
-
-    // ========= Collision (circle vs oriented rect) =========
-    function circleVsBatWithContact(cx, cy, cr) {
-      const rx = cx - stick.x, ry = cy - stick.y;
-      const c = Math.cos(stick.angle), s = Math.sin(stick.angle);
-      // world -> local (bat along +local Y)
-      const lx =  c * rx + s * ry;
-      const ly = -s * rx + c * ry;
-      const halfW = stick.thickness / 2, minY = 0, maxY = stick.lengthPx;
-      const qx = Math.max(-halfW, Math.min(lx, halfW));
-      const qy = Math.max(minY,  Math.min(ly, maxY));
-      const dx = lx - qx, dy = ly - qy;
-      const dist2 = dx*dx + dy*dy;
-
-      let nLocalX, nLocalY, penetration;
-      if (dist2 === 0) { // perfectly on the boundary; pick nearest face normal
-        const distLeft = (lx + halfW), distRight = (halfW - lx), distBottom = (ly - minY), distTop = (maxY - ly);
-        const minDist = Math.min(distLeft, distRight, distBottom, distTop);
-        if (minDist === distLeft)       { nLocalX = -1; nLocalY =  0; }
-        else if (minDist === distRight) { nLocalX =  1; nLocalY =  0; }
-        else if (minDist === distBottom){ nLocalX =  0; nLocalY = -1; }
-        else                            { nLocalX =  0; nLocalY =  1; }
-        penetration = cr;
-      } else {
-        const dist = Math.sqrt(dist2);
-        nLocalX = dx / dist; nLocalY = dy / dist;
-        penetration = cr - dist;
-        if (penetration < 0) return null;
-      }
-
-      // local -> world
-      const nx =  c * nLocalX - s * nLocalY;
-      const ny =  s * nLocalX + c * nLocalY;
-      const qWorldX = stick.x + (c * qx - s * qy);
-      const qWorldY = stick.y + (s * qx + c * qy);
-
-      return { normal: { x: nx, y: ny }, contact: { x: qWorldX, y: qWorldY }, penetration };
-    }
-
-    // ========= Drawing =========
-    function drawRock(r) {
-      ctx.save();
-      ctx.translate(r.x, r.y);
-      ctx.rotate(r.rotation);
-      const R = r.radius;
-      ctx.beginPath();
-      const p0 = r.shape[0];
-      ctx.moveTo(Math.cos(p0.ang) * R * p0.radJitter, Math.sin(p0.ang) * R * p0.radJitter);
-      for (let i = 1; i < r.shape.length; i++) {
-        const p = r.shape[i];
-        ctx.lineTo(Math.cos(p.ang) * R * p.radJitter, Math.sin(p.ang) * R * p.radJitter);
-      }
-      ctx.closePath();
-      const grad = ctx.createRadialGradient(-R * 0.2, -R * 0.25, R * 0.2, 0, 0, R);
-      grad.addColorStop(0, "#a1a1a1"); grad.addColorStop(1, "#555");
-      ctx.fillStyle = grad;
-      ctx.shadowColor = "rgba(0,0,0,0.6)"; ctx.shadowBlur = 8; ctx.fill();
-      ctx.shadowBlur = 0; ctx.lineWidth = 2; ctx.strokeStyle = "#2d2d2d"; ctx.stroke();
-      ctx.globalAlpha = 0.35;
-      ctx.beginPath(); ctx.moveTo(-R * 0.2, -R * 0.1); ctx.lineTo(R * 0.35, R * 0.2);
-      ctx.moveTo(-R * 0.3, R * 0.25); ctx.lineTo(R * 0.15, -R * 0.05);
-      ctx.strokeStyle = "#2a2a2a"; ctx.lineWidth = 1; ctx.stroke();
-      ctx.globalAlpha = 1;
-      ctx.restore();
-    }
-
-    function drawStick() {
-      ctx.save();
-      ctx.translate(stick.x, stick.y);
-      ctx.rotate(stick.angle);
-      const L = stick.lengthPx, T = stick.thickness, r = T/2;
-      ctx.beginPath();
-      ctx.moveTo(-r, 0); ctx.lineTo(-r, L - r); ctx.arc(0, L - r, r, Math.PI, 0, false); ctx.lineTo(r, 0); ctx.closePath();
-      const wood = ctx.createLinearGradient(0, 0, 0, L);
-      wood.addColorStop(0, "#3b2f1a"); wood.addColorStop(0.5, "#8c6239"); wood.addColorStop(1, "#3b2f1a");
-      ctx.fillStyle = wood; ctx.shadowColor = "rgba(0,0,0,0.55)"; ctx.shadowBlur = 10; ctx.fill(); ctx.shadowBlur = 0;
-      ctx.lineWidth = 2; ctx.strokeStyle = "#1c1108"; ctx.stroke();
-      // grip
-      ctx.save(); ctx.beginPath(); ctx.rect(-r, 0, T, Math.min(22, L * 0.15)); ctx.clip();
-      ctx.globalAlpha = 0.35;
-      for (let y = 2; y < 22; y += 3) { ctx.beginPath(); ctx.moveTo(-r, y); ctx.lineTo(r, y); ctx.strokeStyle = "#2c1f10"; ctx.lineWidth = 1; ctx.stroke(); }
-      ctx.globalAlpha = 1; ctx.restore();
-      // grain
-      ctx.save(); ctx.clip(); ctx.globalAlpha = 0.2;
-      for (let y = 6; y < L; y += 14) { ctx.beginPath(); ctx.moveTo(-r + 4, y); ctx.lineTo(r - 4, y + 8); ctx.strokeStyle = "#2c1f10"; ctx.lineWidth = 1; ctx.stroke(); }
-      ctx.globalAlpha = 1; ctx.restore();
-      // pivot marker
-      ctx.beginPath(); ctx.arc(0, 0, 3, 0, Math.PI * 2); ctx.fillStyle = "#ffd166"; ctx.fill(); ctx.lineWidth = 1; ctx.strokeStyle = "#d69e2e"; ctx.stroke();
-      ctx.restore();
-    }
-
-    function drawBackground() {
-      const g = ctx.createRadialGradient(
-        canvas.width/2, canvas.height/2, Math.min(canvas.width, canvas.height)*0.1,
-        canvas.width/2, canvas.height/2, Math.max(canvas.width, canvas.height)*0.7
-      );
-      g.addColorStop(0, "#0f0f10"); g.addColorStop(1, "#0a0a0b");
-      ctx.fillStyle = g; ctx.fillRect(0, 0, canvas.width, canvas.height);
-    }
-
-    // ========= Mouse state =========
-    let lastMouseX = stick.x, lastMouseY = stick.y, lastMouseT = performance.now();
-    let haveMotion = false; // helps avoid jitter when the mouse is still
-
-    canvas.addEventListener("pointermove", (e) => {
-      const now = performance.now();
-      const dt = Math.max(0.001, (now - lastMouseT) / 1000);
-      const dx = e.clientX - lastMouseX, dy = e.clientY - lastMouseY;
-
-      // Move pivot to mouse
-      stick.x = e.clientX; stick.y = e.clientY;
-
-      // Compute desired orientation: perpendicular to motion (bat axis = +local Y)
-      const speed = Math.hypot(dx, dy) / dt; // px/s
-      if (speed > 40) { // ignore tiny jitter
-        const dir = Math.atan2(dy, dx);
-        const desired = dir + Math.PI / 2; // rod points perpendicular to motion
-        // Smooth target to avoid twitching (time-constant ~100ms)
-        const t = 1 - Math.exp(-dt * 10);
-        stick.targetAngle = mixAngle(stick.targetAngle, desired, t);
-        haveMotion = true;
-      } else if (!haveMotion) {
-        // Initialize target once on first move
-        stick.targetAngle = stick.angle;
-      }
-
-      lastMouseX = e.clientX; lastMouseY = e.clientY; lastMouseT = now;
-    });
-
-    // ========= Update (dt-based with substeps) =========
-    let lastFrameT = performance.now();
-
-    function integrate(subdt) {
-      // --- Bat angular dynamics via PD control ---
-      const e = angleDiff(stick.targetAngle, stick.angle);
-      const tau_pd = Kp * e - Kd * stick.angVel;  // N·m
-      // α = τ / I
-      stick.angVel += (tau_pd / stick.I) * subdt;
-      // Clamp
-      if (stick.angVel > MAX_ANG_VEL) stick.angVel = MAX_ANG_VEL;
-      if (stick.angVel < -MAX_ANG_VEL) stick.angVel = -MAX_ANG_VEL;
-      stick.angle = wrapAngle(stick.angle + stick.angVel * subdt);
-
-      // --- Rocks ---
-      for (let i = rocks.length - 1; i >= 0; i--) {
-        const r = rocks[i];
-
-        // Gravity acceleration (px/s^2)
-        r.vy += g_px * subdt;
-
-        // Integrate position
-        r.x += r.vx * subdt;
-        r.y += r.vy * subdt;
-        r.rotation += r.rotationSpeed * subdt;
-
-        // Wall bounces: left/right/top; bottom = delete
-        if (r.x - r.radius < 0) {
-          r.x = r.radius; r.vx = Math.abs(r.vx) * WALL_E; r.rotationSpeed *= -1;
-        } else if (r.x + r.radius > canvas.width) {
-          r.x = canvas.width - r.radius; r.vx = -Math.abs(r.vx) * WALL_E; r.rotationSpeed *= -1;
-        }
-        if (r.y - r.radius < 0) {
-          r.y = r.radius; r.vy = Math.abs(r.vy) * WALL_E; r.rotationSpeed *= -1;
-        }
-
-        // Bottom: disappear (no bounce)
-        if (r.y + r.radius >= canvas.height) {
-          rocks.splice(i, 1);
-          continue;
-        }
-
-        // Bat collision
-        const hit = circleVsBatWithContact(r.x, r.y, r.radius);
-        if (hit) {
-          // Contact normal & point
-          const nx = hit.normal.x, ny = hit.normal.y;
-          const cx = hit.contact.x, cy = hit.contact.y;
-
-          // Bat surface velocity at contact: v = ω × r
-          const rx = cx - stick.x, ry = cy - stick.y;
-          const vSurfX = -stick.angVel * ry;
-          const vSurfY =  stick.angVel * rx;
-
-          // Relative velocity (rock minus bat surface)
-          const vRelX = r.vx - vSurfX;
-          const vRelY = r.vy - vSurfY;
-          const vn = vRelX * nx + vRelY * ny;
-
-          if (vn < 0) {
-            score++; scoreDisplay.textContent = `Score: ${score}`;
-
-            // Normal impulse (bat ≈ infinite mass)
-            let j = -(1 + ROCK_E) * vn * ROCK_MASS;
-            // Safety clamp to avoid numerical explosions on rare edge cases
-            const jMax = 2.5 * ROCK_MASS * Math.hypot(vRelX, vRelY);
-            if (j > jMax) j = jMax;
-
-            r.vx += (j * nx) / ROCK_MASS;
-            r.vy += (j * ny) / ROCK_MASS;
-
-            // Tangential grip/friction to add spin & controllability
-            const tx = -ny, ty = nx;
-            const vt = vRelX * tx + vRelY * ty;
-            const jt = -0.12 * vt * ROCK_MASS; // small
-            r.vx += (jt * tx) / ROCK_MASS;
-            r.vy += (jt * ty) / ROCK_MASS;
-
-            // Spin kick + separation
-            r.rotationSpeed += jt * 0.002;
-            r.x += nx * (hit.penetration + 0.6);
-            r.y += ny * (hit.penetration + 0.6);
-
-            // Reaction torque on the bat (reduced)
-            const torqueImpulse = (rx * ny - ry * nx) * j;
-            stick.angVel -= (torqueImpulse / stick.I) * REACTION_FACTOR;
-
-            // Sound
-            const impact = Math.abs(vn) + Math.abs(stick.angVel) * Math.hypot(rx, ry) / PPM;
-            playBoo(Math.min(1 + impact * 0.05, 2));
-          }
-        }
+  }
+  burst(r.x, r.y, 8 + r.r / 3 | 0, T.base, 330, 'shard', r.r / 9 + 2);
+  burst(r.x, r.y, 8, T.glow, 380, 'spark', 1.6);
+  ring(r.x, r.y, r.r * .5, r.r * 1.8, T.glow, .3, 2);
+  shake += 2 + r.r / 12;
+  doHitstop(r.r > 30 ? 0.045 : 0.022);
+  if (sndOk()) sfxBreak(clamp(r.r / 40, 0, 1));
+  if (r.type === 'magma') booms.push({ x: r.x, y: r.y, R: r.r * 4 + 30 });
+  if (r.type === 'gold') burst(r.x, r.y, 24, '#ffe27a', 500, 'spark', 2.2);
+}
+function processBooms() {
+  if (!booms.length) return;
+  const list = booms.splice(0);
+  for (const b of list) {
+    ring(b.x, b.y, 10, b.R, '#ff8a3a', .45, 6);
+    ring(b.x, b.y, 5, b.R * .6, '#ffe0a0', .3, 3);
+    burst(b.x, b.y, 30, '#ff8a3a', 520, 'spark', 2.4);
+    if (sndOk()) sfxBoom();
+    shake += 9;
+    for (const r of rocks) {
+      if (r.dead || r.boomImm > 0) continue;
+      const dx = r.x - b.x, dy = r.y - b.y, d = Math.hypot(dx, dy) || .01;
+      if (d < b.R + r.r) {
+        const f = 1 - d / (b.R + r.r), k = (520 * f + 150) / TYPES[r.type].mass;
+        r.vx += dx / d * k; r.vy += dy / d * k;
+        damageRock(r, 250 + 800 * f, 'boom');
+        if (!r.dead && Math.hypot(r.vx, r.vy) > 520) r.launched = true;
       }
     }
-
-    function update() {
-      const now = performance.now();
-      let dt = Math.min(0.05, (now - lastFrameT) / 1000); // clamp if tab hiccups
-      lastFrameT = now;
-
-      // Sub-step for stability (<= 8 ms per step)
-      const steps = Math.max(1, Math.min(6, Math.ceil(dt / 0.008)));
-      const subdt = dt / steps;
-      for (let i = 0; i < steps; i++) integrate(subdt);
+  }
+}
+function collideStick(r) {
+  if (r.hitCD > 0) return;
+  const ax = stick.hx, ay = stick.hy, abx = stick.tx - ax, aby = stick.ty - ay, l2 = abx * abx + aby * aby || 1;
+  const s = clamp(((r.x - ax) * abx + (r.y - ay) * aby) / l2, 0, 1);
+  const cx = ax + abx * s, cy = ay + aby * s;
+  let dx = r.x - cx, dy = r.y - cy, d = Math.hypot(dx, dy);
+  const rad = r.r + STICK_R;
+  if (d >= rad) return;
+  if (d < .001) { dx = -aby; dy = abx; d = Math.hypot(dx, dy) || 1; }
+  const nx = dx / d, ny = dy / d;
+  r.x = cx + nx * rad; r.y = cy + ny * rad;
+  const pvx = lerp(vhx, vtx, s), pvy = lerp(vhy, vty, s);
+  const vn = (pvx - r.vx) * nx + (pvy - r.vy) * ny;
+  if (vn <= 0) return;
+  const m = TYPES[r.type].mass * (r.r / 26), k = clamp(1.5 / m, .35, 2.2);
+  r.vx += nx * vn * k; r.vy += ny * vn * k;
+  r.av += ((pvx * ny - pvy * nx) / r.r) * .02;
+  r.hitCD = .09;
+  const rec = clamp(.12 * m, .04, .35) * s;          // stick recoil, gives it weight
+  stick.ptx = lerp(stick.ptx, stick.tx, rec); stick.pty = lerp(stick.pty, stick.ty, rec);
+  const crit = s > .82 && vn > 350;
+  damageRock(r, vn, 'stick', crit);
+  if (!r.dead && Math.hypot(r.vx, r.vy) > 520) r.launched = true;
+}
+function rockCollisions() {
+  for (let i = 0; i < rocks.length; i++) {
+    const a = rocks[i]; if (a.dead || a.noCol > 0) continue;
+    for (let j = i + 1; j < rocks.length; j++) {
+      const b = rocks[j]; if (b.dead || b.noCol > 0) continue;
+      const dx = b.x - a.x, dy = b.y - a.y, rr = a.r + b.r;
+      if (dx * dx + dy * dy >= rr * rr) continue;
+      const d = Math.hypot(dx, dy) || .01, nx = dx / d, ny = dy / d, ov = rr - d;
+      const ma = TYPES[a.type].mass * a.r * a.r, mb = TYPES[b.type].mass * b.r * b.r;
+      a.x -= nx * ov * mb / (ma + mb); a.y -= ny * ov * mb / (ma + mb);
+      b.x += nx * ov * ma / (ma + mb); b.y += ny * ov * ma / (ma + mb);
+      const rv = (a.vx - b.vx) * nx + (a.vy - b.vy) * ny;
+      if (rv <= 0) continue;
+      const jj = 1.5 * rv / (1 / ma + 1 / mb);
+      a.vx -= jj / ma * nx; a.vy -= jj / ma * ny;
+      b.vx += jj / mb * nx; b.vy += jj / mb * ny;
+      if ((a.launched || b.launched) && rv > 220) {
+        const al = a.launched, bl = b.launched;
+        if (al) damageRock(b, rv * 1.3, 'chain'); else damageRock(b, rv * .35, 'chain');
+        if (bl) damageRock(a, rv * 1.3, 'chain'); else damageRock(a, rv * .35, 'chain');
+        for (const q of [a, b]) if (!q.dead && Math.hypot(q.vx, q.vy) > 450) q.launched = true;
+        burst((a.x + b.x) / 2, (a.y + b.y) / 2, 8, '#bfe6ff', 350, 'spark', 1.6);
+      }
     }
+  }
+}
+function hitCore(r) {
+  r.dead = true;
+  burst(r.x, r.y, 12, TYPES[r.type].base, 260, 'shard', 3);
+  if (state !== 'play') { ring(core.x, core.y, core.r, core.r * 2, '#7fd4ff', .3, 2); return; }
+  const dmg = Math.round(r.r * .7);
+  core.hp -= dmg; core.hit = 1; dmgFlash = .5;
+  combo = 0; comboT = 0;
+  shake += 12;
+  if (sndOk()) sfxCore();
+  addText(core.x, core.y - 60, '-' + dmg, '#ff5a5a', 22);
+  burst(core.x, core.y, 16, '#ff5a5a', 300, 'spark', 2);
+  if (core.hp <= 0) gameOver();
+}
+function homeRun(r) {
+  r.dead = true;
+  if (state !== 'play') return;
+  combo++; comboT = 2.4;
+  const pts = Math.round(TYPES[r.type].pts * (0.6 + r.r / 40) * mult() * 1.5);
+  score += pts;
+  if (frenzy <= 0) heat = Math.min(1, heat + .07);
+  addText(clamp(r.x, 70, W - 70), clamp(r.y, 50, H - 50), 'HOME RUN +' + pts, '#9dff8a', 20);
+  if (sndOk()) sfxHome();
+}
 
-    // ========= Render =========
-    function draw() {
-      ctx.clearRect(0, 0, canvas.width, canvas.height);
-      drawBackground();
-      drawStick();
-      for (const r of rocks) drawRock(r);
+/* ---------- flow ---------- */
+function startWave(n) {
+  wave = n; queue = [];
+  for (let i = 0; i < 5 + n * 3; i++) queue.push(pickType(n));
+  spawnT = 1.2; waveBreak = 0;
+  showBanner('WAVE ' + n, n === 1 ? 'protect the core' : '');
+}
+function startGame() {
+  for (const r of rocks) burst(r.x, r.y, 6, TYPES[r.type].base, 200, 'shard', 3);
+  rocks = []; pending = []; booms = [];
+  score = 0; shownScore = 0; combo = 0; comboT = 0; heat = 0; frenzy = 0;
+  core.hp = core.max; state = 'play';
+  startWave(1);
+}
+function gameOver() {
+  state = 'over'; overT = 0; core.hp = 0;
+  burst(core.x, core.y, 60, '#7fd4ff', 700, 'spark', 2.5);
+  burst(core.x, core.y, 30, '#9fb6d6', 500, 'shard', 5);
+  ring(core.x, core.y, 10, 260, '#7fd4ff', .7, 8);
+  if (AC) sfxBoom();
+  shake += 25; frenzy = 0;
+  if (score > best) { best = score; try { localStorage.setItem('rockbonk_best', best); } catch (e) {} }
+}
+function onClick() {
+  initAudio();
+  if (state === 'menu') startGame();
+  else if (state === 'over' && overT > 1) startGame();
+}
+
+/* ---------- update ---------- */
+function stepStick(nhx, nhy, sdt) {
+  const ohx = stick.hx, ohy = stick.hy, otx = stick.tx, oty = stick.ty;
+  stick.hx = nhx; stick.hy = nhy;
+  const damp = Math.pow(0.985, sdt * 240);
+  const vx = (stick.tx - stick.ptx) * damp, vy = (stick.ty - stick.pty) * damp;
+  stick.ptx = stick.tx; stick.pty = stick.ty;
+  const nx = stick.tx + vx, ny = stick.ty + vy, dx = nx - nhx, dy = ny - nhy, d = Math.hypot(dx, dy) || 1;
+  stick.tx = nhx + dx / d * stick.len; stick.ty = nhy + dy / d * stick.len;
+  vhx = (nhx - ohx) / sdt; vhy = (nhy - ohy) / sdt;
+  vtx = (stick.tx - otx) / sdt; vty = (stick.ty - oty) / sdt;
+}
+function flush() { if (pending.length) { rocks.push(...pending); pending.length = 0; } }
+
+function update(dt) {
+  time += dt;
+  stick.len += ((frenzy > 0 ? 215 : 150) - stick.len) * Math.min(1, dt * 8);
+  const n = clamp(Math.ceil(dt * 240), 1, 10), sdt = dt / n, sx = stick.hx, sy = stick.hy;
+  for (let i = 1; i <= n; i++) {
+    stepStick(lerp(sx, mouse.x, i / n), lerp(sy, mouse.y, i / n), sdt);
+    for (const r of rocks) {
+      if (r.dead) continue;
+      r.x += r.vx * sdt; r.y += r.vy * sdt;
+      collideStick(r);
     }
+  }
+  stick.trail.push({ hx: stick.hx, hy: stick.hy, tx: stick.tx, ty: stick.ty });
+  if (stick.trail.length > 12) stick.trail.shift();
+  flush();
 
-    function gameLoop() { update(); draw(); requestAnimationFrame(gameLoop); }
+  const cr = cruise(), kSteer = 1 - Math.exp(-dt * .9);
+  for (const r of rocks) {
+    if (r.dead) continue;
+    r.hitCD -= dt; r.noCol -= dt; r.boomImm -= dt;
+    r.flash = Math.max(0, r.flash - dt * 6);
+    r.a += r.av * dt; r.av *= Math.exp(-dt * .8);
+    let sp = Math.hypot(r.vx, r.vy);
+    if (sp > 1800) { r.vx *= 1800 / sp; r.vy *= 1800 / sp; sp = 1800; }
+    if (r.launched && sp < 330) r.launched = false;
+    const dx = core.x - r.x, dy = core.y - r.y, cd = Math.hypot(dx, dy) || 1;
+    if (!r.launched && state !== 'over') {
+      const c = cr * (r.type === 'iron' ? .8 : r.type === 'gold' ? 1.15 : 1);
+      const ux = dx / cd, uy = dy / cd;
+      let wx = 0, wy = 0;
+      if (r.type === 'gold') { const w = Math.sin(time * 3 + r.seed) * .9; wx = -uy * w; wy = ux * w; }
+      r.vx += ((ux + wx) * c - r.vx) * kSteer; r.vy += ((uy + wy) * c - r.vy) * kSteer;
+    }
+    if (state !== 'over' && cd < r.r + core.r) {
+      if (r.launched) {
+        const nx = -dx / cd, ny = -dy / cd, dot = r.vx * nx + r.vy * ny;
+        r.x = core.x + nx * (r.r + core.r); r.y = core.y + ny * (r.r + core.r);
+        if (dot < 0) { r.vx -= 2 * dot * nx; r.vy -= 2 * dot * ny; }
+        ring(core.x, core.y, core.r, core.r + 18, '#7fd4ff', .25, 2);
+      } else hitCore(r);
+    }
+    const m = r.r + 30;
+    if (!r.dead && (r.x < -m || r.x > W + m || r.y < -m || r.y > H + m)) {
+      if (r.launched) homeRun(r);
+      else if (cd > Math.hypot(W, H)) r.dead = true;
+    }
+  }
+  rockCollisions(); flush();
+  processBooms(); flush();
+  rocks = rocks.filter(r => !r.dead);
 
-    // ========= Start =========
-    setInterval(spawnRock, SPAWN_INTERVAL_MS);
-    gameLoop();
-  </script>
+  if (state === 'play') {
+    comboT -= dt; if (comboT <= 0) combo = 0;
+    if (frenzy > 0) frenzy = Math.max(0, frenzy - dt);
+    else {
+      heat = Math.max(0, heat - dt * .02);
+      if (heat >= 1) { frenzy = 7; heat = 0; showBanner('FRENZY!', 'everything breaks'); if (AC) sfxFrenzy(); shake += 8; }
+    }
+    if (waveBreak > 0) { waveBreak -= dt; if (waveBreak <= 0) startWave(wave + 1); }
+    else {
+      spawnT -= dt;
+      if (queue.length && spawnT <= 0) { spawnRock(queue.pop()); spawnT = Math.max(.4, 1.7 - wave * .1) * rand(.6, 1.3); }
+      if (!queue.length && rocks.length === 0) {
+        waveBreak = 2.5; core.hp = Math.min(core.max, core.hp + 10);
+        showBanner('WAVE ' + wave + ' CLEAR', '+10 core');
+      }
+    }
+  } else if (state === 'menu') {
+    spawnT -= dt;
+    if (spawnT <= 0 && rocks.length < 6) { spawnRock(Math.random() < .2 ? 'magma' : 'stone'); spawnT = 1.6; }
+  } else overT += dt;
+
+  for (const p of parts) {
+    p.life -= dt;
+    if (p.type !== 'ring') {
+      p.x += p.vx * dt; p.y += p.vy * dt;
+      const f = Math.exp(-dt * (p.type === 'shard' ? 2.5 : 4)); p.vx *= f; p.vy *= f; p.a += p.av * dt;
+    }
+  }
+  parts = parts.filter(p => p.life > 0);
+  for (const t of texts) { t.y -= 45 * dt; t.life -= dt * .9; }
+  texts = texts.filter(t => t.life > 0);
+  if (banner) { banner.t += dt; if (banner.t > 2) banner = null; }
+  core.hit = Math.max(0, core.hit - dt * 3);
+  dmgFlash = Math.max(0, dmgFlash - dt);
+  shownScore += (score - shownScore) * Math.min(1, dt * 10);
+}
+
+/* ---------- render ---------- */
+function rockPath(r, ox = 0, oy = 0) {
+  ctx.beginPath();
+  r.pts.forEach(([a, k], i) => {
+    const x = Math.cos(a + r.a) * k * r.r + ox, y = Math.sin(a + r.a) * k * r.r + oy;
+    i ? ctx.lineTo(x, y) : ctx.moveTo(x, y);
+  });
+  ctx.closePath();
+}
+function crackLine(r, c) {
+  ctx.moveTo(Math.cos(c[0] + r.a) * c[1] * r.r, Math.sin(c[0] + r.a) * c[1] * r.r);
+  ctx.lineTo(Math.cos(c[2] + r.a) * c[3] * r.r, Math.sin(c[2] + r.a) * c[3] * r.r);
+}
+function drawRock(r) {
+  const T = TYPES[r.type], R = r.r;
+  if (r.launched) {
+    const sp = Math.hypot(r.vx, r.vy), L = Math.min(sp * .09, 110);
+    const lx = r.x - r.vx / sp * L, ly = r.y - r.vy / sp * L;
+    const g = ctx.createLinearGradient(r.x, r.y, lx, ly);
+    g.addColorStop(0, 'rgba(255,240,200,0.35)'); g.addColorStop(1, 'rgba(255,240,200,0)');
+    ctx.strokeStyle = g; ctx.lineWidth = R * 1.5; ctx.lineCap = 'round';
+    ctx.beginPath(); ctx.moveTo(r.x, r.y); ctx.lineTo(lx, ly); ctx.stroke();
+  }
+  ctx.save(); ctx.translate(r.x, r.y);
+  rockPath(r, 4, 6); ctx.fillStyle = 'rgba(0,0,0,0.35)'; ctx.fill();
+  rockPath(r);
+  const g = ctx.createRadialGradient(-R * .4, -R * .45, R * .05, 0, 0, R * 1.15);
+  g.addColorStop(0, T.hi); g.addColorStop(.5, T.base); g.addColorStop(1, T.dark);
+  ctx.fillStyle = g; ctx.fill();
+  ctx.lineWidth = 2; ctx.strokeStyle = T.dark; ctx.stroke();
+
+  if (r.type === 'magma') {
+    ctx.globalCompositeOperation = 'lighter';
+    ctx.strokeStyle = `rgba(255,${110 + 60 * Math.sin(time * 5 + r.seed) | 0},30,${.55 + .35 * Math.sin(time * 4 + r.seed)})`;
+    ctx.lineWidth = 2.5; ctx.beginPath(); r.cracks.forEach(c => crackLine(r, c)); ctx.stroke();
+    ctx.globalCompositeOperation = 'source-over';
+  } else if (r.type === 'iron') {
+    ctx.fillStyle = 'rgba(210,225,245,0.55)';
+    for (let i = 0; i < 3; i++) {
+      const a = r.a + i * 2.1 + r.seed;
+      ctx.beginPath(); ctx.arc(Math.cos(a) * R * .5, Math.sin(a) * R * .5, 2, 0, TAU); ctx.fill();
+    }
+  } else if (r.type === 'gold') {
+    const tw = Math.max(0, Math.sin(time * 4 + r.seed));
+    ctx.globalCompositeOperation = 'lighter';
+    ctx.fillStyle = `rgba(255,250,220,${tw * .9})`;
+    const s = 3 + tw * 5;
+    ctx.beginPath(); ctx.moveTo(-R * .3, -R * .3 - s); ctx.lineTo(-R * .3 + 1.5, -R * .3); ctx.lineTo(-R * .3, -R * .3 + s);
+    ctx.lineTo(-R * .3 - 1.5, -R * .3); ctx.closePath(); ctx.fill();
+    ctx.beginPath(); ctx.moveTo(-R * .3 - s, -R * .3); ctx.lineTo(-R * .3, -R * .3 + 1.5); ctx.lineTo(-R * .3 + s, -R * .3);
+    ctx.lineTo(-R * .3, -R * .3 - 1.5); ctx.closePath(); ctx.fill();
+    ctx.globalCompositeOperation = 'source-over';
+  }
+  if (r.hp < .75 && r.type !== 'magma') {
+    ctx.strokeStyle = `rgba(10,10,15,${clamp((1 - r.hp) * .9, 0, .8)})`; ctx.lineWidth = 1.6;
+    ctx.beginPath(); r.cracks.forEach((c, i) => { if (i < (r.hp < .4 ? 3 : 2)) crackLine(r, c); }); ctx.stroke();
+  }
+  if (r.flash > 0) { rockPath(r); ctx.fillStyle = `rgba(255,255,255,${r.flash * .7})`; ctx.fill(); }
+  ctx.restore();
+}
+function hexPath(x, y, r, a) {
+  ctx.beginPath();
+  for (let i = 0; i < 6; i++) { const t = a + i / 6 * TAU; i ? ctx.lineTo(x + Math.cos(t) * r, y + Math.sin(t) * r) : ctx.moveTo(x + Math.cos(t) * r, y + Math.sin(t) * r); }
+  ctx.closePath();
+}
+function drawCore() {
+  const f = clamp(core.hp / core.max, 0, 1), hue = 195 * f, pul = 1 + Math.sin(time * 3) * .05;
+  const alive = state !== 'over';
+  ctx.save();
+  if (alive) {
+    ctx.globalCompositeOperation = 'lighter';
+    const g = ctx.createRadialGradient(core.x, core.y, 0, core.x, core.y, core.r * 3.2 * pul);
+    g.addColorStop(0, `hsla(${hue},90%,60%,0.45)`); g.addColorStop(1, `hsla(${hue},90%,60%,0)`);
+    ctx.fillStyle = g; ctx.beginPath(); ctx.arc(core.x, core.y, core.r * 3.2 * pul, 0, TAU); ctx.fill();
+    ctx.globalCompositeOperation = 'source-over';
+  }
+  hexPath(core.x, core.y, core.r * pul, time * .3);
+  const cg = ctx.createLinearGradient(core.x - core.r, core.y - core.r, core.x + core.r, core.y + core.r);
+  cg.addColorStop(0, alive ? `hsl(${hue},90%,82%)` : '#3a414d');
+  cg.addColorStop(1, alive ? `hsl(${hue},80%,38%)` : '#15181e');
+  ctx.fillStyle = cg; ctx.fill();
+  ctx.strokeStyle = alive ? `hsla(${hue},90%,90%,0.8)` : '#444b57'; ctx.lineWidth = 2; ctx.stroke();
+  hexPath(core.x, core.y, core.r * .5 * pul, -time * .6);
+  ctx.fillStyle = alive ? `hsla(${hue},100%,92%,0.85)` : '#22262e'; ctx.fill();
+  if (core.hit > 0) { hexPath(core.x, core.y, core.r * pul, time * .3); ctx.fillStyle = `rgba(255,60,60,${core.hit * .7})`; ctx.fill(); }
+  if (alive) {
+    ctx.lineCap = 'round'; ctx.lineWidth = 4;
+    ctx.strokeStyle = 'rgba(255,255,255,0.08)'; ctx.beginPath(); ctx.arc(core.x, core.y, core.r + 16, 0, TAU); ctx.stroke();
+    ctx.strokeStyle = `hsl(${hue},90%,62%)`; ctx.beginPath();
+    ctx.arc(core.x, core.y, core.r + 16, -Math.PI / 2, -Math.PI / 2 + TAU * f); ctx.stroke();
+  }
+  ctx.restore();
+}
+function drawStick() {
+  const tr = stick.trail, fr = frenzy > 0;
+  ctx.save(); ctx.globalCompositeOperation = 'lighter';
+  for (let i = 1; i < tr.length; i++) {
+    const a = tr[i - 1], b = tr[i], al = i / tr.length * (fr ? .35 : .17);
+    ctx.fillStyle = fr ? `rgba(255,140,40,${al})` : `rgba(190,220,255,${al})`;
+    ctx.beginPath();
+    ctx.moveTo(lerp(a.hx, a.tx, .35), lerp(a.hy, a.ty, .35)); ctx.lineTo(a.tx, a.ty);
+    ctx.lineTo(b.tx, b.ty); ctx.lineTo(lerp(b.hx, b.tx, .35), lerp(b.hy, b.ty, .35));
+    ctx.closePath(); ctx.fill();
+  }
+  ctx.restore();
+  const { hx, hy, tx, ty } = stick;
+  ctx.lineCap = 'round';
+  ctx.strokeStyle = 'rgba(0,0,0,0.35)'; ctx.lineWidth = 12;
+  ctx.beginPath(); ctx.moveTo(hx + 5, hy + 7); ctx.lineTo(tx + 5, ty + 7); ctx.stroke();
+  if (fr) {
+    ctx.save(); ctx.globalCompositeOperation = 'lighter';
+    const fl = .8 + .2 * Math.sin(time * 30);
+    ctx.strokeStyle = `rgba(255,110,20,${.25 * fl})`; ctx.lineWidth = 30; ctx.beginPath(); ctx.moveTo(hx, hy); ctx.lineTo(tx, ty); ctx.stroke();
+    ctx.strokeStyle = `rgba(255,200,80,${.35 * fl})`; ctx.lineWidth = 18; ctx.stroke();
+    ctx.restore();
+  }
+  const g = ctx.createLinearGradient(hx, hy, tx, ty);
+  g.addColorStop(0, '#4d311c'); g.addColorStop(.3, '#8b5a2b'); g.addColorStop(1, '#cf9f5f');
+  ctx.strokeStyle = g; ctx.lineWidth = 11;
+  ctx.beginPath(); ctx.moveTo(hx, hy); ctx.lineTo(tx, ty); ctx.stroke();
+  const dx = tx - hx, dy = ty - hy, L = Math.hypot(dx, dy) || 1, px = -dy / L * 2, py = dx / L * 2;
+  ctx.strokeStyle = 'rgba(255,230,190,0.35)'; ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.moveTo(lerp(hx, tx, .3) + px, lerp(hy, ty, .3) + py); ctx.lineTo(lerp(hx, tx, .95) + px, lerp(hy, ty, .95) + py); ctx.stroke();
+  ctx.strokeStyle = '#26262e'; ctx.lineWidth = 13;
+  ctx.beginPath(); ctx.moveTo(hx, hy); ctx.lineTo(lerp(hx, tx, .18), lerp(hy, ty, .18)); ctx.stroke();
+  ctx.strokeStyle = 'rgba(255,255,255,0.12)'; ctx.lineWidth = 1.5;
+  for (let i = 1; i < 6; i++) {
+    const s = i / 6 * .18, cx = lerp(hx, tx, s), cy = lerp(hy, ty, s);
+    ctx.beginPath(); ctx.moveTo(cx - px * 3, cy - py * 3); ctx.lineTo(cx + px * 3 + dx / L * 3, cy + py * 3 + dy / L * 3); ctx.stroke();
+  }
+  const tg = ctx.createRadialGradient(tx - 2, ty - 2, 1, tx, ty, 9);
+  tg.addColorStop(0, '#ffffff'); tg.addColorStop(.5, fr ? '#ffcf7a' : '#c9d2e0'); tg.addColorStop(1, fr ? '#c2501a' : '#5d6878');
+  ctx.fillStyle = tg; ctx.beginPath(); ctx.arc(tx, ty, 8, 0, TAU); ctx.fill();
+}
+function drawParts() {
+  ctx.save();
+  for (const p of parts) {
+    const al = clamp(p.life / p.max, 0, 1);
+    if (p.type === 'spark') {
+      ctx.globalCompositeOperation = 'lighter';
+      ctx.strokeStyle = p.col; ctx.globalAlpha = al; ctx.lineWidth = p.size; ctx.lineCap = 'round';
+      ctx.beginPath(); ctx.moveTo(p.x, p.y); ctx.lineTo(p.x - p.vx * .035, p.y - p.vy * .035); ctx.stroke();
+    } else if (p.type === 'shard') {
+      ctx.globalCompositeOperation = 'source-over';
+      ctx.fillStyle = p.col; ctx.globalAlpha = al;
+      const s = p.size, c = Math.cos(p.a), sn = Math.sin(p.a);
+      ctx.beginPath(); ctx.moveTo(p.x + c * s, p.y + sn * s);
+      ctx.lineTo(p.x - sn * s * .7, p.y + c * s * .7); ctx.lineTo(p.x - c * s * .6, p.y - sn * s * .9); ctx.closePath(); ctx.fill();
+    } else {
+      ctx.globalCompositeOperation = 'lighter';
+      const t = 1 - al;
+      ctx.strokeStyle = p.col; ctx.globalAlpha = al; ctx.lineWidth = p.w * al + .5;
+      ctx.beginPath(); ctx.arc(p.x, p.y, lerp(p.r0, p.r1, 1 - (1 - t) * (1 - t)), 0, TAU); ctx.stroke();
+    }
+  }
+  ctx.restore();
+}
+function drawTexts() {
+  ctx.save(); ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  for (const t of texts) {
+    const pop = 1 + Math.max(0, (t.life - .85) * 3);
+    ctx.globalAlpha = clamp(t.life * 1.5, 0, 1);
+    ctx.font = `800 ${t.size * pop | 0}px ${FONT}`;
+    ctx.lineWidth = 4; ctx.strokeStyle = 'rgba(0,0,0,0.6)'; ctx.strokeText(t.txt, t.x, t.y);
+    ctx.fillStyle = t.col; ctx.fillText(t.txt, t.x, t.y);
+  }
+  ctx.restore();
+}
+function rr(x, y, w, h, r) { ctx.beginPath(); if (ctx.roundRect) ctx.roundRect(x, y, w, h, r); else ctx.rect(x, y, w, h); }
+function drawHUD() {
+  ctx.save();
+  ctx.textBaseline = 'alphabetic'; ctx.textAlign = 'left';
+  ctx.font = `800 36px ${FONT}`; ctx.fillStyle = '#fff';
+  ctx.fillText(Math.round(shownScore).toLocaleString(), 24, 52);
+  if (combo > 1) {
+    const m = mult(), col = m >= 4 ? '#ff7a2a' : m >= 3 ? '#ffd24a' : m >= 2 ? '#7fd4ff' : '#cfd6e2';
+    ctx.font = `700 16px ${FONT}`; ctx.fillStyle = col;
+    ctx.fillText(`${combo} COMBO   ×${m}`, 24, 78);
+    rr(24, 86, 140, 4, 2); ctx.fillStyle = 'rgba(255,255,255,0.1)'; ctx.fill();
+    rr(24, 86, 140 * clamp(comboT / 2.4, 0, 1), 4, 2); ctx.fillStyle = col; ctx.fill();
+  }
+  ctx.textAlign = 'right';
+  ctx.font = `800 20px ${FONT}`; ctx.fillStyle = '#fff'; ctx.fillText('WAVE ' + wave, W - 24, 44);
+  ctx.font = `600 13px ${FONT}`; ctx.fillStyle = 'rgba(255,255,255,0.5)'; ctx.fillText('BEST ' + best.toLocaleString(), W - 24, 64);
+  const bw = Math.min(300, W * .5), bx = W / 2 - bw / 2, by = H - 32;
+  const v = frenzy > 0 ? frenzy / 7 : heat, full = frenzy > 0;
+  ctx.textAlign = 'center'; ctx.font = `800 11px ${FONT}`;
+  ctx.fillStyle = full ? `rgba(255,190,90,${.7 + .3 * Math.sin(time * 12)})` : 'rgba(255,255,255,0.45)';
+  ctx.fillText(full ? 'F R E N Z Y' : 'H E A T', W / 2, by - 8);
+  rr(bx, by, bw, 8, 4); ctx.fillStyle = 'rgba(255,255,255,0.08)'; ctx.fill();
+  if (v > 0) {
+    const g = ctx.createLinearGradient(bx, 0, bx + bw, 0);
+    g.addColorStop(0, '#ff4d1a'); g.addColorStop(1, '#ffd24a');
+    rr(bx, by, Math.max(8, bw * v), 8, 4); ctx.fillStyle = g; ctx.fill();
+  }
+  ctx.restore();
+}
+function drawBanner() {
+  if (!banner) return;
+  const t = banner.t, a = t < .2 ? t / .2 : t > 1.5 ? Math.max(0, (2 - t) / .5) : 1, s = 1 + Math.max(0, .2 - t) * 1.5;
+  ctx.save(); ctx.globalAlpha = a; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  ctx.translate(W / 2, H * .27); ctx.scale(s, s);
+  ctx.font = `900 ${Math.min(54, W * .09) | 0}px ${FONT}`;
+  ctx.lineWidth = 6; ctx.strokeStyle = 'rgba(0,0,0,0.5)'; ctx.strokeText(banner.text, 0, 0);
+  ctx.fillStyle = banner.text.startsWith('FRENZY') ? '#ffb347' : '#f2ead8'; ctx.fillText(banner.text, 0, 0);
+  if (banner.sub) { ctx.font = `600 15px ${FONT}`; ctx.fillStyle = 'rgba(255,255,255,0.7)'; ctx.fillText(banner.sub.toUpperCase(), 0, 38); }
+  ctx.restore();
+}
+function drawTitle(lines, title, prompt) {
+  ctx.save();
+  ctx.fillStyle = 'rgba(4,6,10,0.5)'; ctx.fillRect(0, 0, W, H);
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  const ts = Math.min(86, W * .13) | 0;
+  ctx.font = `900 ${ts}px ${FONT}`;
+  ctx.fillStyle = 'rgba(0,0,0,0.5)'; ctx.fillText(title, W / 2 + 4, H * .2 + 6);
+  const g = ctx.createLinearGradient(0, H * .2 - ts / 2, 0, H * .2 + ts / 2);
+  g.addColorStop(0, '#fff3dc'); g.addColorStop(1, '#c99a5b');
+  ctx.fillStyle = g; ctx.fillText(title, W / 2, H * .2);
+  ctx.font = `500 ${W < 500 ? 13 : 16}px ${FONT}`; ctx.fillStyle = 'rgba(255,255,255,0.78)';
+  lines.forEach((l, i) => ctx.fillText(l, W / 2, H * .2 + ts * .75 + 10 + i * 26));
+  if (prompt) {
+    ctx.font = `800 18px ${FONT}`; ctx.fillStyle = `rgba(255,220,150,${.55 + .45 * Math.sin(time * 4)})`;
+    ctx.fillText(prompt, W / 2, H * .78);
+  }
+  ctx.restore();
+}
+function render() {
+  ctx.drawImage(bg, 0, 0, W, H);
+  ctx.save();
+  const s = Math.min(shake, 20);
+  ctx.translate((Math.random() - .5) * s * 2, (Math.random() - .5) * s * 2);
+  drawCore();
+  for (const r of rocks) drawRock(r);
+  drawParts();
+  drawStick();
+  drawTexts();
+  ctx.restore();
+
+  if (frenzy > 0) {
+    const g = ctx.createRadialGradient(W / 2, H / 2, Math.min(W, H) * .35, W / 2, H / 2, Math.hypot(W, H) / 2);
+    g.addColorStop(0, 'rgba(255,100,20,0)'); g.addColorStop(1, `rgba(255,100,20,${.18 + .06 * Math.sin(time * 10)})`);
+    ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
+  }
+  if (dmgFlash > 0) {
+    const g = ctx.createRadialGradient(W / 2, H / 2, Math.min(W, H) * .3, W / 2, H / 2, Math.hypot(W, H) / 2);
+    g.addColorStop(0, 'rgba(255,30,30,0)'); g.addColorStop(1, `rgba(255,30,30,${dmgFlash * .6})`);
+    ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
+  }
+  if (state === 'menu') {
+    drawTitle([
+      'Your mouse is the handle. Swing hard — speed is damage.',
+      'Tip hits crit. Smacked rocks fly and smash other rocks.',
+      'Magma explodes · Iron is tough · Gold pays · Keep rocks off the core.',
+    ], 'ROCK BONK', 'CLICK TO START');
+  } else {
+    drawHUD();
+    drawBanner();
+    if (state === 'over') {
+      drawTitle([
+        `Score ${score.toLocaleString()}   ·   Wave ${wave}`,
+        score >= best && score > 0 ? 'NEW BEST' : `Best ${best.toLocaleString()}`,
+      ], 'CORE DOWN', overT > 1 ? 'CLICK TO TRY AGAIN' : '');
+    }
+  }
+}
+
+/* ---------- loop ---------- */
+let last = performance.now();
+function frame(now) {
+  const dt = Math.min(.05, (now - last) / 1000); last = now;
+  sndBudget = 5;
+  hitstopCD -= dt;
+  if (hitstop > 0) hitstop -= dt; else update(dt);
+  shake *= Math.exp(-dt * 9);
+  render();
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+</script>
 </body>
 </html>
